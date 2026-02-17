@@ -1,0 +1,21 @@
+Metadata-Version: 2.4
+Name: driftax
+Version: 0.1.0
+Summary: Drifting generative model (toy demos) implemented in JAX/Flax.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: jax>=0.4.23
+Requires-Dist: flax>=0.7.5
+Requires-Dist: optax>=0.2.2
+Requires-Dist: numpy>=1.24
+Requires-Dist: matplotlib>=3.7
+Requires-Dist: tqdm>=4.66
+Provides-Extra: dev
+Requires-Dist: ruff>=0.4.0; extra == "dev"
+Requires-Dist: pytest>=7.4; extra == "dev"
+Requires-Dist: ipykernel>=6.29; extra == "dev"
+Dynamic: license-file
+
+# driftax
+JAX implementation of https://arxiv.org/abs/2602.04770 

@@ -1,0 +1,11 @@
+jax>=0.4.23
+flax>=0.7.5
+optax>=0.2.2
+numpy>=1.24
+matplotlib>=3.7
+tqdm>=4.66
+
+[dev]
+ruff>=0.4.0
+pytest>=7.4
+ipykernel>=6.29

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "driftax"
+version = "0.1.0"
+description = "Drifting generative model (toy demos) implemented in JAX/Flax."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "jax>=0.4.23",
+  "flax>=0.7.5",
+  "optax>=0.2.2",
+  "numpy>=1.24",
+  "matplotlib>=3.7",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.4.0",
+  "pytest>=7.4",
+  "ipykernel>=6.29",
+]
+
+[project.scripts]
+driftax-train-toy = "driftax.train_toy:main"
+driftax-visualize-drift = "driftax.visualize_drift:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+
+
+

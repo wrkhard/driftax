@@ -1,0 +1,17 @@
+LICENSE
+README.md
+pyproject.toml
+src/driftax/__init__.py
+src/driftax/ckpt.py
+src/driftax/datasets.py
+src/driftax/drift.py
+src/driftax/models.py
+src/driftax/train_toy.py
+src/driftax/visualize_drift.py
+src/driftax.egg-info/PKG-INFO
+src/driftax.egg-info/SOURCES.txt
+src/driftax.egg-info/dependency_links.txt
+src/driftax.egg-info/entry_points.txt
+src/driftax.egg-info/requires.txt
+src/driftax.egg-info/top_level.txt
+tests/test_compute_drift_shapes.py
