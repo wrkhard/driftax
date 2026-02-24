@@ -8,7 +8,7 @@ This repo includes:
 ## Results
 
 ### 1D Inverse Problems: Conditional Inference 
-We evaluate conditional inference on a toy inverse problem with a **multi-modal conditional** structure, and compare drifting against CFM and Mixture Density Network. A reconstruction of the authors original CoLab is also included for uncodintional generation.
+We evaluate conditional inference on a toy inverse problem with a **multi-modal conditional** structure, and compare drifting against CFM and Mixture Density Network. A reconstruction of the authors original CoLab is also included for unconditional generation.
 
 ![1D conditional inference](results/1d_conditional_inference.png)
 
