@@ -130,10 +130,6 @@ def drifting_loss_features(
     return jnp.mean(jnp.sum((x_n - target) ** 2, axis=-1))
 
 
-# ============================================================
-# Conditional drifting (continuous y)
-# ============================================================
-
 def compute_V_conditional(
     x: jnp.ndarray,            # [N, Dx]
     y: jnp.ndarray,            # [N, Dy]
@@ -213,7 +209,7 @@ def drifting_loss_conditional_features(
     if neg_y is None:
         neg_y = y
 
-    # optional feature normalization (like existing drifting_loss_features)
+    # optional feature normalization 
     if feature_normalize:
         targets = jnp.concatenate([pos_feat, neg_feat], axis=0)
         x_n, targets_n, _ = normalize_features(x_feat, targets, stopgrad_scale=True)
@@ -244,11 +240,6 @@ def drifting_loss_conditional_features(
     return jnp.mean(jnp.sum((x_n - target) ** 2, axis=-1))
 
 
-
-# ============================================================
-# Convenience: original drifting loss in (feature) space
-# ============================================================
-
 def drifting_loss(
     x: jnp.ndarray,
     pos: jnp.ndarray,
@@ -263,7 +254,6 @@ def drifting_loss(
     """
     V = compute_V(x, pos, x, temp=float(temp), mask_self_in_neg=True)
     if feature_normalize:
-        # normalize x and V in the same way drifting_loss_features does (simple option)
         x_n, _, scale = normalize_features(x, x, stopgrad_scale=True)
         V = V / (scale + 1e-12)
         x_use = x_n
