@@ -78,7 +78,7 @@ def make_class_index(labels_np: np.ndarray, num_classes: int = 10):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", type=str, default="data", help="directory containing mnist.npz or where to download")
-    ap.add_argument("--out_dir", type=str, default="outputs/mnist_tok", help="output directory")
+    ap.add_argument("--out_dir", type=str, default="outputs/mnist_sdvae_resnet", help="output directory")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tok_steps", type=int, default=3000)
     ap.add_argument("--phi_steps", type=int, default=1500)
@@ -113,7 +113,9 @@ def main():
     key = jax.random.PRNGKey(args.seed)
     key, kinit = jax.random.split(key)
 
-    
+    # -------------------------
+    # 1) Train SD-VAE tokenizer
+    # -------------------------
     tok_cfg = SDVAEConfig(in_ch=1, z_ch=4, base_ch=64, ch_mult=(1, 2, 4), num_res_blocks=2, dropout=0.0)
     tok = SDVAETokenizer(tok_cfg)
     tok_params = tok.init(kinit, jnp.zeros((1, 32, 32, 1), jnp.float32), key, train=True)
@@ -155,11 +157,13 @@ def main():
     z, mean, logvar, xhat = tok.apply(tok_params, xb, kvis, train=False)
     show_grid_save(np.array(xhat), out_dir / "tok_recon.png", title="Tokenizer reconstructions")
 
-  
+    # -------------------------
+    # 2) Train ResNet-GN classifier (phi)
+    # -------------------------
     key, kinit = jax.random.split(key)
     phi_cfg = ResNetGNConfig(in_ch=1, base_ch=64, num_blocks=(2, 2, 2, 2), num_classes=10)
     phi_cls = ResNetGNClassifier(phi_cfg)
-    phi_enc = ResNetGNEncoder(phi_cfg)
+    # Feature encoder is accessed via phi_cls.encode() to share parameters
     phi_params = phi_cls.init(kinit, jnp.zeros((1, 32, 32, 1), jnp.float32))
 
     lr_phi = 2e-4
@@ -188,7 +192,9 @@ def main():
         if s == 1 or (s % (args.print_every * 3) == 0) or s == args.phi_steps:
             print(f"[phi] step {s:4d} ce={float(loss):.4f} acc={float(acc):.3f}")
 
- 
+    # -------------------------
+    # 3) Train generator in latent space with drifting loss in phi feature space
+    # -------------------------
     cfg = DiTLatent2DConfig(h=8, w=8, ch=4, patch=2, dim=256, depth=6, heads=8, cond_dim=256, num_context_tokens=0, drop=0.0)
     gen = DiTLatent2D(cfg)
     class_emb = ClassEmbed(num_classes=10, out_dim=cfg.cond_dim)
@@ -229,8 +235,8 @@ def main():
         x_gen = tok.apply(tok_params, lat_gen, train=False, method=SDVAETokenizer.decode)
         x_pos = sample_pos_images(kp, cls)
 
-        fx = phi_enc.apply(phi_params, x_gen)
-        fp = phi_enc.apply(phi_params, x_pos)
+        fx = phi_cls.apply(phi_params, x_gen, method=ResNetGNClassifier.encode)
+        fp = phi_cls.apply(phi_params, x_pos, method=ResNetGNClassifier.encode)
         fxv_list = feats_to_vecs(fx, grid=4)
         fpv_list = feats_to_vecs(fp, grid=4)
 

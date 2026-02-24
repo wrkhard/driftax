@@ -9,7 +9,9 @@ import jax
 import jax.numpy as jnp
 
 
-
+# ============================================================
+# Core Transformer building blocks (DiT-like)
+# ============================================================
 
 class RMSNorm(nn.Module):
     dim: int
@@ -319,11 +321,13 @@ class TinyConvEncoder(nn.Module):
         return feats
 
 
-
+# ============================================================
+# SD-VAE tokenizer (Stable Diffusion style) + ResNet-GN encoder
+# ============================================================
 
 @dataclass
 class SDVAEConfig:
-    """Stable Diffusion style tokenizer"""
+    """Stable Diffusion style tokenizer (scaled down for MNIST)."""
     in_ch: int = 1
     z_ch: int = 4
     base_ch: int = 64
@@ -384,7 +388,7 @@ class _Upsample(nn.Module):
 
 
 class SDVAEEncoder(nn.Module):
-    """Encoder part of tokenizer"""
+    """Encoder part (separate scope to avoid Linen param name collisions)."""
     cfg: SDVAEConfig
 
     @nn.compact
@@ -409,7 +413,7 @@ class SDVAEEncoder(nn.Module):
 
 
 class SDVAEDecoder(nn.Module):
-    """Decoder part of tokenizer"""
+    """Decoder part (separate scope)."""
     cfg: SDVAEConfig
 
     @nn.compact
@@ -431,7 +435,7 @@ class SDVAEDecoder(nn.Module):
 
 
 class SDVAETokenizer(nn.Module):
-    """Small KL-VAE tokenizer in the style of SD-VAE (Stable Diffusion style)."""
+    """Small KL-VAE tokenizer in the style of SD-VAE (Stable Diffusion)."""
     cfg: SDVAEConfig
 
     def setup(self):
@@ -509,16 +513,25 @@ class ResNetGNEncoder(nn.Module):
 class ResNetGNClassifier(nn.Module):
     cfg: ResNetGNConfig
 
-    @nn.compact
+    def setup(self):
+        self.enc = ResNetGNEncoder(self.cfg)
+        self.head = nn.Dense(self.cfg.num_classes)
+
+    def encode(self, x: jnp.ndarray) -> List[jnp.ndarray]:
+        return self.enc(x)
+
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        feats = ResNetGNEncoder(self.cfg)(x)
+        feats = self.encode(x)
         h = feats[-1]
         h = jnp.mean(h, axis=(1, 2))
-        logits = nn.Dense(self.cfg.num_classes)(h)
+        logits = self.head(h)
         return logits
 
 
 
+# ============================================================
+# Baselines: MDN and Conditional Flow Matching (CFM)
+# ============================================================
 
 @dataclass
 class MDNConfig:
