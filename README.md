@@ -13,7 +13,7 @@ We evaluate conditional inference on a toy inverse problem with a **multi-modal 
 ![1D conditional inference](results/1d_conditional_inference.png)
 
 ### MNIST: DiT Implementation 
-We implement the authors’ DiT-style generator setup for MNIST and visualize conditional samples.
+We implement the authors' DiT-style generator setup for MNIST and visualize conditional samples.
 
 ![MNIST drifting samples](results/mnist_generated_samples.png)
 
