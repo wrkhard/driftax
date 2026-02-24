@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: driftax
-Version: 0.17.2
+Version: 0.18.1
 Summary: Drifting Models (DiT-style) implemented in JAX/Flax.
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown

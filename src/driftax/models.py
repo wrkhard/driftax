@@ -9,6 +9,8 @@ import jax
 import jax.numpy as jnp
 
 
+
+
 class RMSNorm(nn.Module):
     dim: int
     eps: float = 1e-6
@@ -36,7 +38,7 @@ def apply_rope(x: jnp.ndarray, *, base: float = 10000.0) -> jnp.ndarray:
     freq_seq = jnp.arange(half, dtype=jnp.float32)
     inv_freq = 1.0 / (base ** (freq_seq / float(half)))
     pos = jnp.arange(t, dtype=jnp.float32)
-    angles = pos[:, None] * inv_freq[None, :] 
+    angles = pos[:, None] * inv_freq[None, :]  # [T, half]
     sin = jnp.sin(angles)[None, :, None, :]
     cos = jnp.cos(angles)[None, :, None, :]
 
@@ -318,6 +320,206 @@ class TinyConvEncoder(nn.Module):
 
 
 
+
+@dataclass
+class SDVAEConfig:
+    """Stable Diffusion style tokenizer"""
+    in_ch: int = 1
+    z_ch: int = 4
+    base_ch: int = 64
+    ch_mult: Tuple[int, ...] = (1, 2, 4)
+    num_res_blocks: int = 2
+    dropout: float = 0.0
+
+
+class _GN(nn.Module):
+    num_groups: int = 32
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        # Ensure num_groups divides channels
+        c = x.shape[-1]
+        g = min(self.num_groups, c)
+        while g > 1 and (c % g) != 0:
+            g -= 1
+        return nn.GroupNorm(num_groups=g)(x)
+
+
+class _ResBlock(nn.Module):
+    ch: int
+    dropout: float = 0.0
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, *, train: bool) -> jnp.ndarray:
+        h = _GN()(x)
+        h = nn.silu(h)
+        h = nn.Conv(self.ch, (3, 3), padding="SAME")(h)
+
+        h = _GN()(h)
+        h = nn.silu(h)
+        if self.dropout > 0:
+            h = nn.Dropout(self.dropout)(h, deterministic=not train)
+        h = nn.Conv(self.ch, (3, 3), padding="SAME")(h)
+
+        if x.shape[-1] != self.ch:
+            x = nn.Conv(self.ch, (1, 1), padding="SAME")(x)
+        return x + h
+
+
+class _Downsample(nn.Module):
+    ch: int
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        return nn.Conv(self.ch, (3, 3), strides=(2, 2), padding="SAME")(x)
+
+
+class _Upsample(nn.Module):
+    ch: int
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.repeat(jnp.repeat(x, 2, axis=1), 2, axis=2)
+        return nn.Conv(self.ch, (3, 3), padding="SAME")(x)
+
+
+class SDVAEEncoder(nn.Module):
+    """Encoder part of tokenizer"""
+    cfg: SDVAEConfig
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, *, train: bool) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        cfg = self.cfg
+        h = nn.Conv(cfg.base_ch, (3, 3), padding="SAME")(x)
+        ch = cfg.base_ch
+        for i, mult in enumerate(cfg.ch_mult):
+            ch = cfg.base_ch * mult
+            for _ in range(cfg.num_res_blocks):
+                h = _ResBlock(ch, dropout=cfg.dropout)(h, train=train)
+            if i != len(cfg.ch_mult) - 1:
+                h = _Downsample(ch)(h)
+
+        h = _GN()(h); h = nn.silu(h)
+        h = nn.Conv(ch, (3, 3), padding="SAME")(h)
+
+        mean = nn.Conv(cfg.z_ch, (1, 1), padding="SAME")(h)
+        logvar = nn.Conv(cfg.z_ch, (1, 1), padding="SAME")(h)
+        logvar = jnp.clip(logvar, -30.0, 20.0)
+        return mean, logvar
+
+
+class SDVAEDecoder(nn.Module):
+    """Decoder part of tokenizer"""
+    cfg: SDVAEConfig
+
+    @nn.compact
+    def __call__(self, z: jnp.ndarray, *, train: bool) -> jnp.ndarray:
+        cfg = self.cfg
+        ch = cfg.base_ch * cfg.ch_mult[-1]
+        h = nn.Conv(ch, (3, 3), padding="SAME")(z)
+        for i, mult in enumerate(reversed(cfg.ch_mult)):
+            ch = cfg.base_ch * mult
+            for _ in range(cfg.num_res_blocks):
+                h = _ResBlock(ch, dropout=cfg.dropout)(h, train=train)
+            if i != len(cfg.ch_mult) - 1:
+                h = _Upsample(ch)(h)
+
+        h = _GN()(h); h = nn.silu(h)
+        x = nn.Conv(cfg.in_ch, (3, 3), padding="SAME")(h)
+        x = jnp.tanh(x)  # SD-style [-1,1]
+        return x
+
+
+class SDVAETokenizer(nn.Module):
+    """Small KL-VAE tokenizer in the style of SD-VAE (Stable Diffusion style)."""
+    cfg: SDVAEConfig
+
+    def setup(self):
+        self.enc = SDVAEEncoder(self.cfg)
+        self.dec = SDVAEDecoder(self.cfg)
+
+    def encode(self, x: jnp.ndarray, *, train: bool) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        return self.enc(x, train=train)
+
+    def decode(self, z: jnp.ndarray, *, train: bool) -> jnp.ndarray:
+        return self.dec(z, train=train)
+
+    def reparam(self, key: jax.Array, mean: jnp.ndarray, logvar: jnp.ndarray) -> jnp.ndarray:
+        eps = jax.random.normal(key, mean.shape, dtype=mean.dtype)
+        return mean + jnp.exp(0.5 * logvar) * eps
+
+    def __call__(
+        self, x: jnp.ndarray, key: jax.Array, *, train: bool
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        mean, logvar = self.encode(x, train=train)
+        z = self.reparam(key, mean, logvar)
+        xhat = self.decode(z, train=train)
+        return z, mean, logvar, xhat
+
+
+@dataclass
+class ResNetGNConfig:
+    in_ch: int = 1
+    base_ch: int = 64
+    num_blocks: Tuple[int, int, int, int] = (2, 2, 2, 2)  # like ResNet-18 stages
+    num_classes: int = 10
+
+
+class _BasicBlockGN(nn.Module):
+    ch: int
+    stride: int = 1
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        h = nn.Conv(self.ch, (3, 3), strides=(self.stride, self.stride), padding="SAME")(x)
+        h = _GN()(h); h = nn.silu(h)
+        h = nn.Conv(self.ch, (3, 3), padding="SAME")(h)
+        h = _GN()(h)
+
+        if self.stride != 1 or x.shape[-1] != self.ch:
+            x = nn.Conv(self.ch, (1, 1), strides=(self.stride, self.stride), padding="SAME")(x)
+            x = _GN()(x)
+
+        return nn.silu(x + h)
+
+
+class ResNetGNEncoder(nn.Module):
+    cfg: ResNetGNConfig
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> List[jnp.ndarray]:
+        cfg = self.cfg
+        feats: List[jnp.ndarray] = []
+
+        h = nn.Conv(cfg.base_ch, (3, 3), padding="SAME")(x)
+        h = _GN()(h); h = nn.silu(h)
+        feats.append(h)
+
+        ch = cfg.base_ch
+        for si, nb in enumerate(cfg.num_blocks):
+            for bi in range(nb):
+                stride = 2 if (bi == 0 and si > 0) else 1
+                h = _BasicBlockGN(ch, stride=stride)(h)
+            feats.append(h)
+            ch = min(ch * 2, cfg.base_ch * 8)
+
+        return feats
+
+
+class ResNetGNClassifier(nn.Module):
+    cfg: ResNetGNConfig
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        feats = ResNetGNEncoder(self.cfg)(x)
+        h = feats[-1]
+        h = jnp.mean(h, axis=(1, 2))
+        logits = nn.Dense(self.cfg.num_classes)(h)
+        return logits
+
+
+
+
 @dataclass
 class MDNConfig:
     num_mixtures: int = 8
@@ -327,25 +529,16 @@ class MDNConfig:
 
 
 class MDN1D(nn.Module):
-    """Conditional Mixture Density Network for 1D target: p(x | y).
-
-    Outputs a K-component Gaussian mixture:
-      - logits: [B,K]
-      - means:  [B,K]
-      - scales: [B,K] (positive)
-
-    This mirrors the MDN interface used in JaxMix (PredictiveIntelligenceLab/JaxMix).
-    """
+    """Conditional Mixture Density Network for 1D target: p(x | y)."""
     cfg: MDNConfig
 
     @nn.compact
     def __call__(self, y: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        # y: [B,1] or [B,D]
         x = y
         for _ in range(self.cfg.depth):
             x = nn.Dense(self.cfg.hidden)(x)
             x = nn.gelu(x)
-        out = nn.Dense(3 * self.cfg.num_mixtures)(x)  # [B, 3K]
+        out = nn.Dense(3 * self.cfg.num_mixtures)(x)
         logits, means, scales_raw = jnp.split(out, 3, axis=-1)
         scales = nn.softplus(scales_raw) + self.cfg.min_scale
         return logits, means, scales
@@ -354,33 +547,17 @@ class MDN1D(nn.Module):
 def mdn_log_prob_1d(
     logits: jnp.ndarray, means: jnp.ndarray, scales: jnp.ndarray, x: jnp.ndarray
 ) -> jnp.ndarray:
-    """Log p(x) under a 1D Gaussian mixture.
-
-    Args:
-      logits, means, scales: [B,K]
-      x: [B,1] or [B]
-    Returns:
-      logprob: [B]
-    """
     if x.ndim == 2:
         x = x[:, 0]
-    log_pi = jax.nn.log_softmax(logits, axis=-1)  # [B,K]
-
-    # log N(x|mu,s)
+    log_pi = jax.nn.log_softmax(logits, axis=-1)
     z = (x[:, None] - means) / scales
     log_norm = -0.5 * jnp.log(2.0 * jnp.pi) - jnp.log(scales)
     log_exp = -0.5 * (z * z)
-    log_comp = log_norm + log_exp  # [B,K]
+    log_comp = log_norm + log_exp
+    return jax.scipy.special.logsumexp(log_pi + log_comp, axis=-1)
 
-    return jax.scipy.special.logsumexp(log_pi + log_comp, axis=-1)  # [B]
 
-
-def mdn_nll_1d(
-    params: dict,
-    model: MDN1D,
-    y: jnp.ndarray,
-    x: jnp.ndarray,
-) -> jnp.ndarray:
+def mdn_nll_1d(params: dict, model: MDN1D, y: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
     logits, means, scales = model.apply(params, y)
     lp = mdn_log_prob_1d(logits, means, scales, x)
     return -jnp.mean(lp)
@@ -389,39 +566,22 @@ def mdn_nll_1d(
 def mdn_mixture_pdf_1d(
     logits: jnp.ndarray, means: jnp.ndarray, scales: jnp.ndarray, grid: jnp.ndarray
 ) -> jnp.ndarray:
-    """Compute mixture pdf on a grid.
-    Args:
-      logits, means, scales: [K] (single condition)
-      grid: [M]
-    Returns:
-      pdf: [M]
-    """
-    pi = jax.nn.softmax(logits, axis=-1)  # [K]
-    # Normal pdf
+    pi = jax.nn.softmax(logits, axis=-1)
     z = (grid[:, None] - means[None, :]) / scales[None, :]
-    norm = (1.0 / (jnp.sqrt(2.0 * jnp.pi) * scales[None, :])) * jnp.exp(-0.5 * z * z)  # [M,K]
-    return jnp.sum(pi[None, :] * norm, axis=-1)  # [M]
-
+    norm = (1.0 / (jnp.sqrt(2.0 * jnp.pi) * scales[None, :])) * jnp.exp(-0.5 * z * z)
+    return jnp.sum(pi[None, :] * norm, axis=-1)
 
 
 @dataclass
 class CFMConfig:
     hidden: int = 256
     depth: int = 4
-    sigma: float = 0.0  # 0.0 => OT-CFM style straight path
-    steps: int = 50     # sampling Euler steps
+    sigma: float = 0.0
+    steps: int = 50
 
 
 class CondVelocityMLP(nn.Module):
-    """Conditional velocity field v_theta(y, x_t, t) -> dx/dt.
-
-    Inputs are concatenated: [y, x_t, t] where:
-      - y:   [B,1] condition
-      - x_t: [B,2] state at time t
-      - t:   [B,1] time in [0,1]
-    Output:
-      - v:   [B,2]
-    """
+    """Conditional velocity field v_theta(y, x_t, t) -> dx/dt."""
     cfg: CFMConfig
 
     @nn.compact
@@ -443,26 +603,14 @@ class CondVelocityMLP(nn.Module):
 
 def cfm_batch(
     key: jax.Array,
-    x1: jnp.ndarray,  # data state [B,2]
-    y: jnp.ndarray,   # condition [B,1]
+    x1: jnp.ndarray,
+    y: jnp.ndarray,
     sigma: float = 0.0,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Build a CFM training batch (x_t, t, u_t, y).
-
-    We sample:
-      - x0 ~ N(0,I)
-      - t ~ U(0,1)
-      - x_t = (1-t) x0 + t x1 + sigma * eps
-      - target velocity u_t = (x1 - x0)
-
-    Returns:
-      x_t: [B,2], t:[B,1], u:[B,2], y:[B,1]
-    """
     k0, kt, ke = jax.random.split(key, 3)
     B = x1.shape[0]
     x0 = jax.random.normal(k0, (B, 2), dtype=x1.dtype)
     t = jax.random.uniform(kt, (B, 1), minval=0.0, maxval=1.0, dtype=x1.dtype)
-
     eps = jax.random.normal(ke, (B, 2), dtype=x1.dtype)
     x_t = (1.0 - t) * x0 + t * x1 + float(sigma) * eps
     u = x1 - x0
@@ -490,10 +638,6 @@ def cfm_sample(
     *,
     steps: int = 50,
 ) -> jnp.ndarray:
-    """Generate samples by Euler integrating dx/dt = v_theta(y, x, t) from t=0..1.
-
-    Start x0 ~ N(0,I), keep y fixed. Returns x1 ~ learned conditional.
-    """
     if y.ndim == 1:
         y = y[:, None]
     B = y.shape[0]

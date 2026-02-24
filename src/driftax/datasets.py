@@ -123,5 +123,6 @@ def load_mnist_npz(cache_dir: str = "data") -> Tuple[np.ndarray, np.ndarray, np.
 
 
 def preprocess_mnist(x: np.ndarray) -> np.ndarray:
+    """uint8 [0..255] -> float32 in [-1, 1], with channel dim."""
     x = x.astype(np.float32) / 127.5 - 1.0
     return x[..., None]  # [N,28,28,1]
