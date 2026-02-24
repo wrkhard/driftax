@@ -3,12 +3,12 @@ JAX implementation of https://arxiv.org/abs/2602.04770
 
 This repo includes:
 - **1D inverse-problem / conditional inference** demos (with comparisons against other conditional density baselines).
-- **MNIST DiT-style drifting model** following the authors’ training recipe (small-scale, fast-to-run example).
+- **MNIST DiT-style drifting model** following the authors' approach.
 
 ## Results
 
 ### 1D Inverse Problems: Conditional Inference 
-We evaluate conditional inference on a toy inverse problem with a **multi-modal conditional** structure, and compare drifting against CFM and Mixture Density Network. A reconstruction of the authors original CoLab is also included for unconditional generation.
+We evaluate conditional inference on a toy inverse problem with a **multi-modal conditional** structure, and compare drifting against CFM and Mixture Density Network.
 
 ![1D conditional inference](results/1d_conditional_inference.png)
 
