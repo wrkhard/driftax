@@ -1,99 +1,75 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import List, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
 
 
-def _cdist_l2(a: jnp.ndarray, b: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
-    """Euclidean distance matrix between a:[N,D] and b:[M,D] -> [N,M]."""
-    a2 = jnp.sum(a * a, axis=-1, keepdims=True)        # [N,1]
-    b2 = jnp.sum(b * b, axis=-1, keepdims=True).T      # [1,M]
-    dist2 = jnp.maximum(a2 + b2 - 2.0 * (a @ b.T), 0.0)
-    return jnp.sqrt(dist2 + eps)
-
-
-def _softmax2d_rowcol(logit: jnp.ndarray) -> jnp.ndarray:
-    """ A = sqrt(softmax_row * softmax_col)"""
-    a_row = jax.nn.softmax(logit, axis=1)  # over columns
-    a_col = jax.nn.softmax(logit, axis=0)  # over rows
-    return jnp.sqrt(a_row * a_col)
+def _cdist_l2(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
+    a2 = jnp.sum(a * a, axis=1, keepdims=True)
+    b2 = jnp.sum(b * b, axis=1, keepdims=True).T
+    return jnp.sqrt(jnp.maximum(a2 + b2 - 2.0 * (a @ b.T), 0.0) + 1e-12)
 
 
 def compute_V(
     x: jnp.ndarray,
     y_pos: jnp.ndarray,
     y_neg: jnp.ndarray,
-    temp: float,
+    temperature: float,
     *,
-    neg_log_weights: Optional[jnp.ndarray] = None,
-    mask_self_in_neg: bool = True,
+    mask_self: bool = True,
 ) -> jnp.ndarray:
-    """Compute drifting field V (Algorithm 2) with optional weighted negatives (CFG-style)."""
-    n = x.shape[0]
-    n_pos = y_pos.shape[0]
-    n_neg = y_neg.shape[0]
+    N = x.shape[0]
+    dist_pos = _cdist_l2(x, y_pos)
+    dist_neg = _cdist_l2(x, y_neg)
 
-    dist_pos = _cdist_l2(x, y_pos)  # [N, N_pos]
-    dist_neg = _cdist_l2(x, y_neg)  # [N, N_neg]
+    if mask_self and (y_neg.shape[0] == N):
+        dist_neg = dist_neg + jnp.eye(N, dtype=dist_neg.dtype) * 1e6
 
-    if mask_self_in_neg and n_neg >= n:
-        dist_neg = dist_neg.at[:, :n].add(jnp.eye(n, dtype=dist_neg.dtype) * 1e6)
+    logit_pos = -dist_pos / float(temperature)
+    logit_neg = -dist_neg / float(temperature)
+    logit = jnp.concatenate([logit_pos, logit_neg], axis=1)
 
-    logit_pos = -dist_pos / temp
-    logit_neg = -dist_neg / temp
-    if neg_log_weights is not None:
-        logit_neg = logit_neg + neg_log_weights[None, :]
+    A_row = jax.nn.softmax(logit, axis=1)
+    A_col = jax.nn.softmax(logit, axis=0)
+    A = jnp.sqrt(A_row * A_col)
 
-    logit = jnp.concatenate([logit_pos, logit_neg], axis=1)  # [N, N_pos+N_neg]
-    A = _softmax2d_rowcol(logit)
-
-    A_pos = A[:, :n_pos]
-    A_neg = A[:, n_pos:]
+    P = y_pos.shape[0]
+    A_pos = A[:, :P]
+    A_neg = A[:, P:]
 
     W_pos = A_pos * jnp.sum(A_neg, axis=1, keepdims=True)
     W_neg = A_neg * jnp.sum(A_pos, axis=1, keepdims=True)
 
-    drift_pos = W_pos @ y_pos
-    drift_neg = W_neg @ y_neg
-    return drift_pos - drift_neg
+    return (W_pos @ y_pos) - (W_neg @ y_neg)
 
 
-def _mean_pairwise_dist(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    return jnp.mean(_cdist_l2(x, y))
-
-
-def normalize_features(
+def compute_V_multi_temperature(
     x: jnp.ndarray,
-    y: jnp.ndarray,
+    y_pos: jnp.ndarray,
+    y_neg: jnp.ndarray,
+    temperatures: Sequence[float] = (0.02, 0.05, 0.2),
     *,
-    target_mean_dist: float = 1.0,
-    stopgrad_scale: bool = True,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Scale features so mean pairwise distance is ~ target_mean_dist (Appendix A.6)."""
-    mean_dist = _mean_pairwise_dist(x, y)
-    feat_scale = mean_dist / target_mean_dist
-    if stopgrad_scale:
-        feat_scale = jax.lax.stop_gradient(feat_scale)
-    x_n = x / (feat_scale + 1e-12)
-    y_n = y / (feat_scale + 1e-12)
-    return x_n, y_n, feat_scale
+    mask_self: bool = True,
+    normalize_each: bool = True,
+) -> jnp.ndarray:
+    V_total = jnp.zeros_like(x)
+    for tau in temperatures:
+        V_tau = compute_V(x, y_pos, y_neg, float(tau), mask_self=mask_self)
+        if normalize_each:
+            vnorm = jnp.sqrt(jnp.mean(V_tau * V_tau) + 1e-8)
+            V_tau = V_tau / (vnorm + 1e-8)
+        V_total = V_total + V_tau
+    return V_total
 
 
-def normalize_drift(
-    V: jnp.ndarray,
-    *,
-    target_mean_norm: float = 1.0,
-    stopgrad_scale: bool = False,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Scale drift magnitudes (Appendix A.6)."""
-    mean_norm = jnp.mean(jnp.sqrt(jnp.sum(V * V, axis=-1) + 1e-12))
-    drift_scale = mean_norm / target_mean_norm
-    if stopgrad_scale:
-        drift_scale = jax.lax.stop_gradient(drift_scale)
-    return V / (drift_scale + 1e-12), drift_scale
+def l2_normalize(x: jnp.ndarray, axis: int = -1, eps: float = 1e-12) -> jnp.ndarray:
+    return x / jnp.sqrt(jnp.sum(x * x, axis=axis, keepdims=True) + eps)
+
+
+def global_avg_pool(feat_map: jnp.ndarray) -> jnp.ndarray:
+    return jnp.mean(feat_map, axis=(1, 2))
 
 
 def drifting_loss_features(
@@ -102,75 +78,92 @@ def drifting_loss_features(
     *,
     temps: Sequence[float] = (0.02, 0.05, 0.2),
     neg_feat: Optional[jnp.ndarray] = None,
-    neg_log_weights: Optional[jnp.ndarray] = None,
     feature_normalize: bool = True,
     drift_normalize: bool = True,
+    normalize_each_temp: Optional[bool] = None,
+    mask_self_in_neg: bool = True,
 ) -> jnp.ndarray:
-    """Drifting loss in feature space with multi-T aggregation (Appendix A.6)."""
     if neg_feat is None:
         neg_feat = x_feat
 
+    x = x_feat
+    p = pos_feat
+    n = neg_feat
+
     if feature_normalize:
-        targets = jnp.concatenate([pos_feat, neg_feat], axis=0)
-        x_n, targets_n, _ = normalize_features(x_feat, targets, stopgrad_scale=True)
-        pos_n = targets_n[: pos_feat.shape[0]]
-        neg_n = targets_n[pos_feat.shape[0] :]
-    else:
-        x_n, pos_n, neg_n = x_feat, pos_feat, neg_feat
+        x = l2_normalize(x, axis=-1)
+        p = l2_normalize(p, axis=-1)
+        n = l2_normalize(n, axis=-1)
 
-    Vs = []
-    for T in temps:
-        Vs.append(compute_V(x_n, pos_n, neg_n, float(T), neg_log_weights=neg_log_weights, mask_self_in_neg=True))
-    V = sum(Vs) / float(len(Vs))
+    if normalize_each_temp is None:
+        normalize_each_temp = bool(drift_normalize)
 
-    if drift_normalize:
-        V, _ = normalize_drift(V, stopgrad_scale=False)
+    V = compute_V_multi_temperature(
+        x, p, n,
+        temperatures=temps,
+        mask_self=mask_self_in_neg and (n.shape[0] == x.shape[0]),
+        normalize_each=bool(normalize_each_temp),
+    )
 
-    target = jax.lax.stop_gradient(x_n + V)
-    return jnp.mean(jnp.sum((x_n - target) ** 2, axis=-1))
+    target = jax.lax.stop_gradient(x + V)
+    return jnp.mean(jnp.sum((x - target) ** 2, axis=-1))
 
 
+def drifting_loss_multiscale_pooled(
+    x_maps: List[jnp.ndarray],
+    pos_maps: List[jnp.ndarray],
+    *,
+    temps: Sequence[float] = (0.02, 0.05, 0.2),
+    feature_normalize: bool = True,
+    drift_normalize: bool = True,
+) -> jnp.ndarray:
+    assert len(x_maps) == len(pos_maps)
+    loss = 0.0
+    for xm, pm in zip(x_maps, pos_maps):
+        xv = global_avg_pool(xm)
+        pv = global_avg_pool(pm)
+        loss = loss + drifting_loss_features(
+            x_feat=xv,
+            pos_feat=pv,
+            temps=temps,
+            neg_feat=xv,
+            feature_normalize=feature_normalize,
+            drift_normalize=drift_normalize,
+        )
+    return loss / float(len(x_maps))
 
 
 def compute_V_conditional(
-    x: jnp.ndarray,            # [N, Dx]
-    y: jnp.ndarray,            # [N, Dy]
-    pos_x: jnp.ndarray,        # [P, Dx]
-    pos_y: jnp.ndarray,        # [P, Dy]
-    neg_x: jnp.ndarray,        # [M, Dx]
-    neg_y: jnp.ndarray,        # [M, Dy]
+    x: jnp.ndarray,
+    y: jnp.ndarray,
+    pos_x: jnp.ndarray,
+    pos_y: jnp.ndarray,
+    neg_x: jnp.ndarray,
+    neg_y: jnp.ndarray,
+    *,
     temp_x: float,
     temp_y: float,
-    *,
-    neg_log_weights: jnp.ndarray | None = None,
+    beta_y: float = 1.0,
     mask_self_in_neg: bool = True,
 ) -> jnp.ndarray:
-    """Compute drift in x-space with a y-aware kernel.
-
-    Similarity logits are:
-        - (||x - x'|| / temp_x + ||y - y'|| / temp_y)
-
-    This prevents positives from other conditions (far in y) from pulling x.
-    """
-    # distances
-    dist_pos_x = _cdist(x, pos_x)  # [N,P]
-    dist_neg_x = _cdist(x, neg_x)  # [N,M]
-    dist_pos_y = _cdist(y, pos_y)  # [N,P]
-    dist_neg_y = _cdist(y, neg_y)  # [N,M]
+    dx_pos = _cdist_l2(x, pos_x)
+    dx_neg = _cdist_l2(x, neg_x)
+    dy_pos = _cdist_l2(y, pos_y)
+    dy_neg = _cdist_l2(y, neg_y)
 
     n = x.shape[0]
     if mask_self_in_neg and (neg_x.shape[0] >= n):
-        big = jnp.eye(n, dtype=dist_neg_x.dtype) * 1e6
-        dist_neg_x = dist_neg_x.at[:, :n].add(big)
-        dist_neg_y = dist_neg_y.at[:, :n].add(big)
+        big = jnp.eye(n, dtype=dx_neg.dtype) * 1e6
+        dx_neg = dx_neg.at[:, :n].add(big)
+        dy_neg = dy_neg.at[:, :n].add(big)
 
-    logit_pos = -(dist_pos_x / float(temp_x) + dist_pos_y / float(temp_y))
-    logit_neg = -(dist_neg_x / float(temp_x) + dist_neg_y / float(temp_y))
-    if neg_log_weights is not None:
-        logit_neg = logit_neg + neg_log_weights[None, :]
-
+    logit_pos = -(dx_pos / float(temp_x) + float(beta_y) * (dy_pos / float(temp_y)))
+    logit_neg = -(dx_neg / float(temp_x) + float(beta_y) * (dy_neg / float(temp_y)))
     logit = jnp.concatenate([logit_pos, logit_neg], axis=1)
-    A = _softmax2d_rowcol(logit)
+
+    A_row = jax.nn.softmax(logit, axis=1)
+    A_col = jax.nn.softmax(logit, axis=0)
+    A = jnp.sqrt(A_row * A_col)
 
     P = pos_x.shape[0]
     A_pos = A[:, :P]
@@ -188,86 +181,47 @@ def drifting_loss_conditional_features(
     pos_feat: jnp.ndarray,
     pos_y: jnp.ndarray,
     *,
-    temps_x: tuple[float, ...] = (0.02, 0.05, 0.2),
+    temps_x: Sequence[float] = (0.05,),
     temp_y: float = 0.05,
-    neg_feat: jnp.ndarray | None = None,
-    neg_y: jnp.ndarray | None = None,
-    neg_log_weights: jnp.ndarray | None = None,
+    beta_y: float = 3.0,
     feature_normalize: bool = True,
     drift_normalize: bool = True,
 ) -> jnp.ndarray:
-    """Conditional drifting loss in a feature space (Sec. 3.4-style), continuous y.
+    neg_feat = x_feat
+    neg_y = y
 
-    Implements:
-        E || phi(x) - stopgrad(phi(x) + V_phi(x)) ||^2
-    but computes V using y-aware logits so conditioning is respected.
+    x = x_feat
+    px = pos_feat
+    nx = neg_feat
 
-    - x_feat: [N,D] features of generated samples phi(x)
-    - y:      [N,Dy] conditions for generated samples
-    - pos_feat,pos_y: positives from data distribution with their conditions
-    """
-    if neg_feat is None:
-        neg_feat = x_feat
-    if neg_y is None:
-        neg_y = y
-
-    # optional feature normalization (like existing drifting_loss_features)
     if feature_normalize:
-        targets = jnp.concatenate([pos_feat, neg_feat], axis=0)
-        x_n, targets_n, _ = normalize_features(x_feat, targets, stopgrad_scale=True)
-        pos_n = targets_n[: pos_feat.shape[0]]
-        neg_n = targets_n[pos_feat.shape[0] :]
-    else:
-        x_n, pos_n, neg_n = x_feat, pos_feat, neg_feat
+        x = l2_normalize(x, axis=-1)
+        px = l2_normalize(px, axis=-1)
+        nx = l2_normalize(nx, axis=-1)
 
-    Vs = []
+    V = jnp.zeros_like(x)
     for Tx in temps_x:
-        Vs.append(
-            compute_V_conditional(
-                x_n, y,
-                pos_n, pos_y,
-                neg_n, neg_y,
-                temp_x=float(Tx),
-                temp_y=float(temp_y),
-                neg_log_weights=neg_log_weights,
-                mask_self_in_neg=True,
-            )
+        Vt = compute_V_conditional(
+            x, y,
+            px, pos_y,
+            nx, neg_y,
+            temp_x=float(Tx),
+            temp_y=float(temp_y),
+            beta_y=float(beta_y),
+            mask_self_in_neg=True,
         )
-    V = sum(Vs) / float(len(Vs))
+        if drift_normalize:
+            vnorm = jnp.sqrt(jnp.mean(Vt * Vt) + 1e-8)
+            Vt = Vt / (vnorm + 1e-8)
+        V = V + Vt
 
-    if drift_normalize:
-        V, _ = normalize_drift(V, stopgrad_scale=False)
-
-    target = jax.lax.stop_gradient(x_n + V)
-    return jnp.mean(jnp.sum((x_n - target) ** 2, axis=-1))
-
-
+    target = jax.lax.stop_gradient(x + V)
+    return jnp.mean(jnp.sum((x - target) ** 2, axis=-1))
 
 
-
-def drifting_loss(
-    x: jnp.ndarray,
-    pos: jnp.ndarray,
-    *,
-    temp: float = 0.05,
-    feature_normalize: bool = False,
-    drift_normalize: bool = False,
-) -> jnp.ndarray:
-    """Drifting loss: MSE(x, stopgrad(x + V)) where V is computed against `pos`.
-
-    This mirrors the original toy loss used in the colab / toy examples.
-    """
-    V = compute_V(x, pos, x, temp=float(temp), mask_self_in_neg=True)
-    if feature_normalize:
-        # normalize x and V in the same way drifting_loss_features does (simple option)
-        x_n, _, scale = normalize_features(x, x, stopgrad_scale=True)
-        V = V / (scale + 1e-12)
-        x_use = x_n
-    else:
-        x_use = x
-
-    if drift_normalize:
-        V, _ = normalize_drift(V, stopgrad_scale=False)
-
-    target = jax.lax.stop_gradient(x_use + V)
-    return jnp.mean(jnp.sum((x_use - target) ** 2, axis=-1))
+def drifting_loss(gen=None, pos=None, compute_drift=None, **kwargs):
+    if callable(compute_drift):
+        V = compute_drift(gen, pos)
+        target = jax.lax.stop_gradient(gen + V)
+        return jnp.mean(jnp.sum((gen - target) ** 2, axis=-1))
+    return drifting_loss_features(**kwargs)

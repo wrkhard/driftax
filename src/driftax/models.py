@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import jax.scipy
 
 
-# ============================================================
-# Core Transformer building blocks (DiT-like)
-# ============================================================
+
 
 class RMSNorm(nn.Module):
     dim: int
@@ -158,6 +157,52 @@ class DiTBlock(nn.Module):
         return x
 
 
+
+
+class LabelEmbedder(nn.Module):
+    """Class embedding with a null class and optional dropout (CFG-style training)."""
+    num_classes: int
+    out_dim: int
+    dropout_prob: float = 0.1
+
+    @nn.compact
+    def __call__(
+        self,
+        labels: jnp.ndarray,
+        *,
+        train: bool,
+        force_drop_ids: Optional[jnp.ndarray] = None,
+    ) -> jnp.ndarray:
+        if train and self.dropout_prob > 0:
+            if force_drop_ids is None:
+                drop = jax.random.bernoulli(self.make_rng("drop"), self.dropout_prob, labels.shape)
+            else:
+                drop = force_drop_ids.astype(bool)
+            labels = jnp.where(drop, jnp.int32(self.num_classes), labels)
+        return nn.Embed(self.num_classes + 1, self.out_dim)(labels)
+
+
+class AlphaEmbedder(nn.Module):
+    """Embed a CFG alpha scale using Fourier features + MLP."""
+    out_dim: int
+    frequency_embedding_size: int = 256
+    max_period: float = 10.0
+
+    @staticmethod
+    def _fourier(alpha: jnp.ndarray, dim: int, max_period: float) -> jnp.ndarray:
+        half = dim // 2
+        freqs = jnp.exp(-jnp.log(max_period) * jnp.arange(half, dtype=jnp.float32) / float(half))
+        args = alpha[:, None] * freqs[None, :]
+        return jnp.concatenate([jnp.cos(args), jnp.sin(args)], axis=-1)
+
+    @nn.compact
+    def __call__(self, alpha: jnp.ndarray) -> jnp.ndarray:
+        ff = self._fourier(alpha, self.frequency_embedding_size, self.max_period)
+        h = nn.Dense(self.out_dim)(ff); h = nn.silu(h)
+        h = nn.Dense(self.out_dim)(h)
+        return h
+
+
 class CondMLP(nn.Module):
     in_dim: int
     out_dim: int
@@ -172,12 +217,14 @@ class CondMLP(nn.Module):
 
 
 class ClassEmbed(nn.Module):
+    """Simple class embedding without dropout (kept for backward compatibility)."""
     num_classes: int
     out_dim: int
 
     @nn.compact
     def __call__(self, cls: jnp.ndarray) -> jnp.ndarray:
         return nn.Embed(self.num_classes, self.out_dim)(cls)
+
 
 
 @dataclass
@@ -304,6 +351,95 @@ class DiTLatent2D(nn.Module):
         return x
 
 
+class DriftDiT2D(nn.Module):
+    """DiT wrapper: conditioning = label_embed(null+dropout) + alpha_embed, plus CFG forward."""
+    dit_cfg: DiTLatent2DConfig
+    num_classes: int = 10
+    label_dropout: float = 0.1
+
+    def setup(self):
+        self.dit = DiTLatent2D(self.dit_cfg)
+        self.label_emb = LabelEmbedder(self.num_classes, self.dit_cfg.cond_dim, dropout_prob=self.label_dropout)
+        self.alpha_emb = AlphaEmbedder(self.dit_cfg.cond_dim)
+
+    def __call__(self, z: jnp.ndarray, labels: jnp.ndarray, alpha: jnp.ndarray, *, train: bool) -> jnp.ndarray:
+        c = self.label_emb(labels, train=train) + self.alpha_emb(alpha)
+        return self.dit(z, c, train=train)
+
+    def forward_with_cfg(self, z: jnp.ndarray, labels: jnp.ndarray, alpha: float) -> jnp.ndarray:
+        b = z.shape[0]
+        a = jnp.full((b,), float(alpha), dtype=jnp.float32)
+        null = jnp.full((b,), jnp.int32(self.num_classes), dtype=jnp.int32)
+        x_u = self.__call__(z, null, a, train=False)
+        x_c = self.__call__(z, labels, a, train=False)
+        return x_u + a[:, None, None, None] * (x_c - x_u)
+
+
+
+
+class _GN(nn.Module):
+    num_groups: int = 32
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        g = int(min(self.num_groups, x.shape[-1]))
+        return nn.GroupNorm(num_groups=g)(x)
+
+class _BasicBlockGN(nn.Module):
+    ch: int
+    stride: int = 1
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, *, train: bool = False) -> jnp.ndarray:
+        h = nn.Conv(self.ch, (3, 3), strides=(self.stride, self.stride), padding="SAME", use_bias=False)(x)
+        h = _GN()(h); h = nn.gelu(h)
+        h = nn.Conv(self.ch, (3, 3), padding="SAME", use_bias=False)(h)
+        h = _GN()(h)
+
+        if self.stride != 1 or x.shape[-1] != self.ch:
+            x = nn.Conv(self.ch, (1, 1), strides=(self.stride, self.stride), padding="SAME", use_bias=False)(x)
+            x = _GN()(x)
+
+        return nn.gelu(x + h)
+
+class MultiScaleFeatureEncoder(nn.Module):
+    """Multi-scale residual CNN encoder returning 4 feature maps."""
+    in_ch: int = 1
+    base_width: int = 64
+    blocks_per_stage: int = 2
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, *, train: bool = False) -> List[jnp.ndarray]:
+        feats: List[jnp.ndarray] = []
+
+        h = nn.Conv(self.base_width, (3, 3), padding="SAME", use_bias=False)(x)
+        h = _GN()(h); h = nn.gelu(h)
+
+        for _ in range(self.blocks_per_stage):
+            h = _BasicBlockGN(self.base_width, stride=1)(h, train=train)
+        feats.append(h)
+
+        ch2 = self.base_width * 2
+        h = _BasicBlockGN(ch2, stride=2)(h, train=train)
+        for _ in range(self.blocks_per_stage - 1):
+            h = _BasicBlockGN(ch2, stride=1)(h, train=train)
+        feats.append(h)
+
+        ch3 = self.base_width * 4
+        h = _BasicBlockGN(ch3, stride=2)(h, train=train)
+        for _ in range(self.blocks_per_stage - 1):
+            h = _BasicBlockGN(ch3, stride=1)(h, train=train)
+        feats.append(h)
+
+        ch4 = self.base_width * 8
+        h = _BasicBlockGN(ch4, stride=2)(h, train=train)
+        for _ in range(self.blocks_per_stage - 1):
+            h = _BasicBlockGN(ch4, stride=1)(h, train=train)
+        feats.append(h)
+
+        return feats
+
+
+
 class TinyConvEncoder(nn.Module):
     base: int = 32
 
@@ -321,32 +457,15 @@ class TinyConvEncoder(nn.Module):
         return feats
 
 
-# ============================================================
-# SD-VAE tokenizer (Stable Diffusion style) + ResNet-GN encoder
-# ============================================================
 
 @dataclass
 class SDVAEConfig:
-    """Stable Diffusion style tokenizer (scaled down for MNIST)."""
     in_ch: int = 1
     z_ch: int = 4
     base_ch: int = 64
     ch_mult: Tuple[int, ...] = (1, 2, 4)
     num_res_blocks: int = 2
     dropout: float = 0.0
-
-
-class _GN(nn.Module):
-    num_groups: int = 32
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        # Ensure num_groups divides channels
-        c = x.shape[-1]
-        g = min(self.num_groups, c)
-        while g > 1 and (c % g) != 0:
-            g -= 1
-        return nn.GroupNorm(num_groups=g)(x)
 
 
 class _ResBlock(nn.Module):
@@ -372,7 +491,6 @@ class _ResBlock(nn.Module):
 
 class _Downsample(nn.Module):
     ch: int
-
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         return nn.Conv(self.ch, (3, 3), strides=(2, 2), padding="SAME")(x)
@@ -380,7 +498,6 @@ class _Downsample(nn.Module):
 
 class _Upsample(nn.Module):
     ch: int
-
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = jnp.repeat(jnp.repeat(x, 2, axis=1), 2, axis=2)
@@ -388,7 +505,6 @@ class _Upsample(nn.Module):
 
 
 class SDVAEEncoder(nn.Module):
-    """Encoder part (separate scope to avoid Linen param name collisions)."""
     cfg: SDVAEConfig
 
     @nn.compact
@@ -413,7 +529,6 @@ class SDVAEEncoder(nn.Module):
 
 
 class SDVAEDecoder(nn.Module):
-    """Decoder part (separate scope)."""
     cfg: SDVAEConfig
 
     @nn.compact
@@ -430,12 +545,11 @@ class SDVAEDecoder(nn.Module):
 
         h = _GN()(h); h = nn.silu(h)
         x = nn.Conv(cfg.in_ch, (3, 3), padding="SAME")(h)
-        x = jnp.tanh(x)  # SD-style [-1,1]
+        x = jnp.tanh(x)
         return x
 
 
 class SDVAETokenizer(nn.Module):
-    """Small KL-VAE tokenizer in the style of SD-VAE (Stable Diffusion)."""
     cfg: SDVAEConfig
 
     def setup(self):
@@ -452,9 +566,7 @@ class SDVAETokenizer(nn.Module):
         eps = jax.random.normal(key, mean.shape, dtype=mean.dtype)
         return mean + jnp.exp(0.5 * logvar) * eps
 
-    def __call__(
-        self, x: jnp.ndarray, key: jax.Array, *, train: bool
-    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def __call__(self, x: jnp.ndarray, key: jax.Array, *, train: bool) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         mean, logvar = self.encode(x, train=train)
         z = self.reparam(key, mean, logvar)
         xhat = self.decode(z, train=train)
@@ -465,26 +577,8 @@ class SDVAETokenizer(nn.Module):
 class ResNetGNConfig:
     in_ch: int = 1
     base_ch: int = 64
-    num_blocks: Tuple[int, int, int, int] = (2, 2, 2, 2)  # like ResNet-18 stages
+    num_blocks: Tuple[int, int, int, int] = (2, 2, 2, 2)
     num_classes: int = 10
-
-
-class _BasicBlockGN(nn.Module):
-    ch: int
-    stride: int = 1
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        h = nn.Conv(self.ch, (3, 3), strides=(self.stride, self.stride), padding="SAME")(x)
-        h = _GN()(h); h = nn.silu(h)
-        h = nn.Conv(self.ch, (3, 3), padding="SAME")(h)
-        h = _GN()(h)
-
-        if self.stride != 1 or x.shape[-1] != self.ch:
-            x = nn.Conv(self.ch, (1, 1), strides=(self.stride, self.stride), padding="SAME")(x)
-            x = _GN()(x)
-
-        return nn.silu(x + h)
 
 
 class ResNetGNEncoder(nn.Module):
@@ -503,7 +597,7 @@ class ResNetGNEncoder(nn.Module):
         for si, nb in enumerate(cfg.num_blocks):
             for bi in range(nb):
                 stride = 2 if (bi == 0 and si > 0) else 1
-                h = _BasicBlockGN(ch, stride=stride)(h)
+                h = _BasicBlockGN(ch if si == 0 else ch, stride=stride)(h)
             feats.append(h)
             ch = min(ch * 2, cfg.base_ch * 8)
 
@@ -524,14 +618,12 @@ class ResNetGNClassifier(nn.Module):
         feats = self.encode(x)
         h = feats[-1]
         h = jnp.mean(h, axis=(1, 2))
-        logits = self.head(h)
-        return logits
+        return self.head(h)
 
 
-
-# ============================================================
-# Baselines: MDN and Conditional Flow Matching (CFM)
-# ============================================================
+"""
+ Condiftional Flow Matchting and MDN for 1D example.
+"""
 
 @dataclass
 class MDNConfig:
@@ -542,7 +634,6 @@ class MDNConfig:
 
 
 class MDN1D(nn.Module):
-    """Conditional Mixture Density Network for 1D target: p(x | y)."""
     cfg: MDNConfig
 
     @nn.compact
@@ -557,9 +648,7 @@ class MDN1D(nn.Module):
         return logits, means, scales
 
 
-def mdn_log_prob_1d(
-    logits: jnp.ndarray, means: jnp.ndarray, scales: jnp.ndarray, x: jnp.ndarray
-) -> jnp.ndarray:
+def mdn_log_prob_1d(logits: jnp.ndarray, means: jnp.ndarray, scales: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
     if x.ndim == 2:
         x = x[:, 0]
     log_pi = jax.nn.log_softmax(logits, axis=-1)
@@ -576,9 +665,7 @@ def mdn_nll_1d(params: dict, model: MDN1D, y: jnp.ndarray, x: jnp.ndarray) -> jn
     return -jnp.mean(lp)
 
 
-def mdn_mixture_pdf_1d(
-    logits: jnp.ndarray, means: jnp.ndarray, scales: jnp.ndarray, grid: jnp.ndarray
-) -> jnp.ndarray:
+def mdn_mixture_pdf_1d(logits: jnp.ndarray, means: jnp.ndarray, scales: jnp.ndarray, grid: jnp.ndarray) -> jnp.ndarray:
     pi = jax.nn.softmax(logits, axis=-1)
     z = (grid[:, None] - means[None, :]) / scales[None, :]
     norm = (1.0 / (jnp.sqrt(2.0 * jnp.pi) * scales[None, :])) * jnp.exp(-0.5 * z * z)
@@ -594,7 +681,6 @@ class CFMConfig:
 
 
 class CondVelocityMLP(nn.Module):
-    """Conditional velocity field v_theta(y, x_t, t) -> dx/dt."""
     cfg: CFMConfig
 
     @nn.compact
@@ -610,47 +696,27 @@ class CondVelocityMLP(nn.Module):
         for _ in range(self.cfg.depth):
             h = nn.Dense(self.cfg.hidden)(h)
             h = nn.gelu(h)
-        v = nn.Dense(2)(h)
-        return v
+        return nn.Dense(x_t.shape[-1])(h)
 
 
-def cfm_batch(
-    key: jax.Array,
-    x1: jnp.ndarray,
-    y: jnp.ndarray,
-    sigma: float = 0.0,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+def cfm_batch(key: jax.Array, x1: jnp.ndarray, y: jnp.ndarray, sigma: float = 0.0):
     k0, kt, ke = jax.random.split(key, 3)
     B = x1.shape[0]
-    x0 = jax.random.normal(k0, (B, 2), dtype=x1.dtype)
+    x0 = jax.random.normal(k0, x1.shape, dtype=x1.dtype)
     t = jax.random.uniform(kt, (B, 1), minval=0.0, maxval=1.0, dtype=x1.dtype)
-    eps = jax.random.normal(ke, (B, 2), dtype=x1.dtype)
+    eps = jax.random.normal(ke, x1.shape, dtype=x1.dtype)
     x_t = (1.0 - t) * x0 + t * x1 + float(sigma) * eps
     u = x1 - x0
     return x_t, t, u, y
 
 
-def cfm_loss(
-    params: dict,
-    model: CondVelocityMLP,
-    key: jax.Array,
-    x1: jnp.ndarray,
-    y: jnp.ndarray,
-    sigma: float = 0.0,
-) -> jnp.ndarray:
+def cfm_loss(params: dict, model: CondVelocityMLP, key: jax.Array, x1: jnp.ndarray, y: jnp.ndarray, sigma: float = 0.0):
     x_t, t, u, y_in = cfm_batch(key, x1, y, sigma=sigma)
     v = model.apply(params, y_in, x_t, t)
     return jnp.mean(jnp.sum((v - u) ** 2, axis=-1))
 
 
-def cfm_sample(
-    params: dict,
-    model: CondVelocityMLP,
-    key: jax.Array,
-    y: jnp.ndarray,
-    *,
-    steps: int = 50,
-) -> jnp.ndarray:
+def cfm_sample(params: dict, model: CondVelocityMLP, key: jax.Array, y: jnp.ndarray, *, steps: int = 50):
     if y.ndim == 1:
         y = y[:, None]
     B = y.shape[0]
@@ -662,5 +728,4 @@ def cfm_sample(
         v = model.apply(params, y, x, t)
         return x + dt * v
 
-    x = jax.lax.fori_loop(0, steps, body, x)
-    return x
+    return jax.lax.fori_loop(0, steps, body, x)
