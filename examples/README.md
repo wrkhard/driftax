@@ -20,5 +20,6 @@ bash examples/run_toy2d.sh --dataset swiss
 bash examples/run_drift_quiver.sh --dataset checkerboard
 ```
 
+# TODO
+Update 1d Ring exmple
 
-Ring: try stronger conditioning with `--temp_y 0.03` (smaller => stronger).
