@@ -1,7 +1,7 @@
 Metadata-Version: 2.4
 Name: driftax
-Version: 0.1.0
-Summary: Drifting generative model (toy demos) implemented in JAX/Flax.
+Version: 0.13.2
+Summary: Drifting Models (DiT-style) implemented in JAX/Flax.
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
 License-File: LICENSE
@@ -19,3 +19,13 @@ Dynamic: license-file
 
 # driftax
 JAX implementation of https://arxiv.org/abs/2602.04770 
+
+
+If you use this library please cite the original authors here:
+
+@article{deng2026drifting,
+  title={Generative Modeling via Drifting},
+  author={Deng, Mingyang and Li, He and Li, Tianhong and Du, Yilun and He, Kaiming},
+  journal={arXiv preprint arXiv:2602.04770},
+  year={2026}
+}

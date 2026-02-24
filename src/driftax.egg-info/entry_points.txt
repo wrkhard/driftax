@@ -1,3 +1,0 @@
-[console_scripts]
-driftax-train-toy = driftax.train_toy:main
-driftax-visualize-drift = driftax.visualize_drift:main

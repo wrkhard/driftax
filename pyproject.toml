@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "driftax"
-version = "0.1.0"
-description = "Drifting generative model (toy demos) implemented in JAX/Flax."
+version = "0.13.2"
+description = "Drifting Models (DiT-style) implemented in JAX/Flax."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -24,10 +24,6 @@ dev = [
   "ipykernel>=6.29",
 ]
 
-[project.scripts]
-driftax-train-toy = "driftax.train_toy:main"
-driftax-visualize-drift = "driftax.visualize_drift:main"
-
 [tool.setuptools]
 package-dir = {"" = "src"}
 
@@ -36,6 +32,3 @@ where = ["src"]
 
 [tool.ruff]
 line-length = 100
-
-
-
