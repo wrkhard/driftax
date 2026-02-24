@@ -7,12 +7,12 @@ This repo includes:
 
 ## Results
 
-### 1D Inverse Problems: Conditional Inference (Comparisons)
-We evaluate conditional inference on a toy inverse problem with a **multi-modal conditional** structure, and compare drifting against other common conditional approaches.
+### 1D Inverse Problems: Conditional Inference 
+We evaluate conditional inference on a toy inverse problem with a **multi-modal conditional** structure, and compare drifting against CFM and Mixture Density Network. A reconstruction of the authors original CoLab is also included for uncodintional generation.
 
 ![1D conditional inference](results/1d_conditional_inference.png)
 
-### MNIST: DiT Implementation (Author Recipe)
+### MNIST: DiT Implementation 
 We implement the authors’ DiT-style generator setup for MNIST and visualize conditional samples.
 
 ![MNIST drifting samples](results/mnist_generated_samples.png)
