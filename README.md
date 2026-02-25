@@ -1,5 +1,5 @@
 # driftax
-JAX implementation of https://arxiv.org/abs/2602.04770
+JAX implementation of Generative Modeling via Drifting: https://arxiv.org/abs/2602.04770
 
 This repo includes:
 - **1D inverse-problem / conditional inference** demos (with comparisons against other conditional density baselines).
