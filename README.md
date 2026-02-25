@@ -27,3 +27,6 @@ If you use this library please cite the original authors here:
   journal={arXiv preprint arXiv:2602.04770},
   year={2026}
 }
+
+---
+To see more JAX projects check out [Awesome JAX](https://github.com/lockwo/awesome-jax)
